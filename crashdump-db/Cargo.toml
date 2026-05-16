@@ -1,0 +1,10 @@
+[package]
+name = "crashdump-db"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "crashdump_db"
+
+[dependencies]
+zstd = "0.13"
