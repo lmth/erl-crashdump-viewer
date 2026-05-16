@@ -228,6 +228,34 @@ Open `http://localhost:4000` in your browser.
 
 ---
 
+## REST API
+
+Every endpoint in `ecd-server` supports content-negotiation.  Add
+`Accept: application/json` to any request and you get structured JSON back
+instead of the HTMX HTML fragment.  This makes the server usable as a
+headless analysis back-end from scripts, CI pipelines, or other tooling.
+
+Typical workflow:
+
+```sh
+# 1. Upload and start parsing
+JOB=$(curl -sF dump=@erl_crash.dump http://localhost:4000/dumps | jq -r .job_id)
+
+# 2. Poll until done
+until [ "$(curl -s http://localhost:4000/jobs/$JOB | jq -r .status)" = "done" ]; do
+  sleep 2
+done
+FP=$(curl -s http://localhost:4000/jobs/$JOB | jq -r .fingerprint)
+
+# 3. Query the data
+curl -sH 'Accept: application/json' http://localhost:4000/dumps/$FP | jq .process_count
+curl -sH 'Accept: application/json' "http://localhost:4000/dumps/$FP/procs" | jq '.processes[0]'
+```
+
+See **[docs/REST.md](docs/REST.md)** for the full endpoint reference.
+
+---
+
 ## Development
 
 ```sh
