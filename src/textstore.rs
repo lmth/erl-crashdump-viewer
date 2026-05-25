@@ -47,9 +47,14 @@ use crate::model::Page;
 
 const MAGIC: &[u8; 8] = b"TDBMETA2";
 const MAGIC_OLD: &[u8; 8] = b"TDBMETA1";
+const LINE_IDX_MAGIC: &[u8; 8] = b"TDBLIDX1";
 
 /// Maximum uncompressed bytes per frame before a flush is triggered.
 pub const TEXT_FRAME_SIZE: usize = 64 * 1024;
+
+/// Sparse line index interval: one entry every N non-empty lines.
+/// At 1 000 lines/entry: 4 M lines → 4 000 entries (32 KB); 800 M lines → 6.4 MB.
+const LINE_INDEX_INTERVAL: u64 = 1_000;
 
 const ZSTD_LEVEL: i32 = 3;
 
@@ -91,6 +96,9 @@ pub struct TextWriter {
     sections: Vec<SecEntry>,
     string_table: Vec<u8>,
     frames: Vec<FrameEntry>,
+    /// Sparse line index per section, in insertion order (parallel to `sections`).
+    /// Each entry: (frame_idx, pos_in_frame, byte_offset_into_section).
+    section_line_indices: Vec<Vec<(u32, u32, u64)>>,
 }
 
 impl TextWriter {
@@ -107,6 +115,7 @@ impl TextWriter {
             sections: Vec::new(),
             string_table: Vec::new(),
             frames: Vec::new(),
+            section_line_indices: Vec::new(),
             dir,
         })
     }
@@ -126,6 +135,7 @@ impl TextWriter {
             total_written: 0,
             non_empty_lines: 0,
             current_line_has_content: false,
+            sparse_entries: Vec::new(),
         }
     }
 
@@ -154,15 +164,19 @@ impl TextWriter {
         Ok(())
     }
 
-    /// Flush remaining data, sort the index, and write `meta.bin`.
+    /// Flush remaining data, sort the index, and write `meta.bin` + `line_idx.bin`.
     pub fn finish(mut self) -> Result<()> {
         self.flush_frame()?;
         self.zdb.flush()?;
 
-        // Sort section index by key string for binary search.
+        // Build sort permutation so both sections and line_indices are reordered
+        // identically (they must remain parallel after the sort).
         let st = &self.string_table;
-        self.sections
-            .sort_unstable_by(|a, b| key_bytes(st, a.str_offset).cmp(key_bytes(st, b.str_offset)));
+        let mut order: Vec<usize> = (0..self.sections.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            key_bytes(st, self.sections[a].str_offset)
+                .cmp(key_bytes(st, self.sections[b].str_offset))
+        });
 
         let mut meta = BufWriter::new(File::create(self.dir.join("meta.bin"))?);
         meta.write_all(MAGIC)?;
@@ -170,7 +184,8 @@ impl TextWriter {
         write_u32(&mut meta, self.sections.len() as u32)?;
         write_u32(&mut meta, self.frames.len() as u32)?;
         meta.write_all(&self.string_table)?;
-        for s in &self.sections {
+        for &i in &order {
+            let s = &self.sections[i];
             write_u32(&mut meta, s.str_offset)?;
             write_u32(&mut meta, s.start_frame)?;
             write_u32(&mut meta, s.start_pos)?;
@@ -184,6 +199,24 @@ impl TextWriter {
             write_u32(&mut meta, f.compressed_size)?;
         }
         meta.flush()?;
+
+        // Write line_idx.bin in the same sorted order.
+        let mut lidx = BufWriter::new(File::create(self.dir.join("line_idx.bin"))?);
+        lidx.write_all(LINE_IDX_MAGIC)?;
+        write_u32(&mut lidx, LINE_INDEX_INTERVAL as u32)?;
+        write_u32(&mut lidx, self.sections.len() as u32)?;
+        for &i in &order {
+            let entries = &self.section_line_indices[i];
+            write_u32(&mut lidx, entries.len() as u32)?;
+            for &(frame_idx, pos, byte_off) in entries {
+                write_u32(&mut lidx, frame_idx)?;
+                write_u32(&mut lidx, pos)?;
+                write_u32(&mut lidx, byte_off as u32)?;
+                write_u32(&mut lidx, (byte_off >> 32) as u32)?;
+            }
+        }
+        lidx.flush()?;
+
         Ok(())
     }
 }
@@ -208,6 +241,9 @@ pub struct SectionWriter<'a> {
     non_empty_lines: u64,
     /// True when the current (unfinished) line contains at least one byte.
     current_line_has_content: bool,
+    /// Sparse index entries: (frame_idx, pos_in_frame, byte_offset_into_section).
+    /// One entry every LINE_INDEX_INTERVAL non-empty lines.
+    sparse_entries: Vec<(u32, u32, u64)>,
 }
 
 impl<'a> SectionWriter<'a> {
@@ -216,27 +252,51 @@ impl<'a> SectionWriter<'a> {
     /// Memory footprint: at most one 64 KiB uncompressed frame at a time,
     /// regardless of how large `data` is.
     pub fn write(&mut self, data: &str) -> Result<()> {
-        // Track non-empty line count as we scan bytes.
-        for &b in data.as_bytes() {
-            if b == b'\n' {
-                if self.current_line_has_content {
-                    self.non_empty_lines += 1;
+        let bytes = data.as_bytes();
+
+        // Pass 1 – count non-empty lines and record sparse index entries.
+        //
+        // We simulate the frame position (without actual I/O) to know exactly
+        // where each line boundary will land after the bulk copy in Pass 2.
+        // The invariant `frame_buf.len() < TEXT_FRAME_SIZE` guarantees the
+        // simulation stays in sync with the real writer state.
+        {
+            let mut sim_frame = self.writer.frame_idx as u64;
+            let mut sim_pos = self.writer.frame_buf.len();
+            let mut sim_byte = self.total_written;
+
+            for &b in bytes {
+                sim_pos += 1;
+                sim_byte += 1;
+                if sim_pos == TEXT_FRAME_SIZE {
+                    sim_frame += 1;
+                    sim_pos = 0;
                 }
-                self.current_line_has_content = false;
-            } else {
-                self.current_line_has_content = true;
+                if b == b'\n' {
+                    if self.current_line_has_content {
+                        self.non_empty_lines += 1;
+                        if self.non_empty_lines % LINE_INDEX_INTERVAL == 0 {
+                            // Record the position right after this '\n',
+                            // i.e. the start of the next line.
+                            self.sparse_entries
+                                .push((sim_frame as u32, sim_pos as u32, sim_byte));
+                        }
+                    }
+                    self.current_line_has_content = false;
+                } else {
+                    self.current_line_has_content = true;
+                }
             }
         }
 
-        // Stream into frames, flushing when each frame is full.
-        // Invariant maintained: frame_buf.len() < TEXT_FRAME_SIZE after this returns.
-        let mut bytes = data.as_bytes();
-        while !bytes.is_empty() {
+        // Pass 2 – bulk copy into frames (unchanged from original).
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
             let space = TEXT_FRAME_SIZE - self.writer.frame_buf.len();
-            let take = bytes.len().min(space);
-            self.writer.frame_buf.extend_from_slice(&bytes[..take]);
+            let take = remaining.len().min(space);
+            self.writer.frame_buf.extend_from_slice(&remaining[..take]);
             self.total_written += take as u64;
-            bytes = &bytes[take..];
+            remaining = &remaining[take..];
             if self.writer.frame_buf.len() == TEXT_FRAME_SIZE {
                 self.writer.flush_frame()?;
             }
@@ -257,6 +317,9 @@ impl<'a> SectionWriter<'a> {
         if self.total_written == 0 {
             return Ok(());
         }
+
+        // Push sparse line index (parallel to sections vec).
+        self.writer.section_line_indices.push(self.sparse_entries);
 
         let str_offset = self.writer.string_table.len() as u32;
         self.writer.string_table.extend_from_slice(self.kind.as_bytes());
@@ -287,6 +350,9 @@ pub struct TextReader {
     sections: Vec<SecEntry>,
     string_table: Vec<u8>,
     frames: Vec<FrameEntry>,
+    /// Sparse line index parallel to `sections`.
+    /// Entry i in section s: position of the start of line (i+1)*LINE_INDEX_INTERVAL.
+    line_indices: Vec<Vec<(u32, u32, u64)>>,
 }
 
 impl TextReader {
@@ -336,12 +402,52 @@ impl TextReader {
             });
         }
 
+        let line_indices = Self::load_line_idx(dir, sections.len())
+            .unwrap_or_else(|_| vec![vec![]; sections.len()]);
+
         Ok(TextReader {
             zdb: File::open(dir.join("sections.zdb"))?,
             sections,
             string_table,
             frames,
+            line_indices,
         })
+    }
+
+    fn load_line_idx(dir: &Path, section_count: usize) -> Result<Vec<Vec<(u32, u32, u64)>>> {
+        let path = dir.join("line_idx.bin");
+        let mut f = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return Ok(vec![vec![]; section_count]),
+        };
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic)?;
+        if &magic != LINE_IDX_MAGIC {
+            return Ok(vec![vec![]; section_count]);
+        }
+        let interval = read_u32(&mut f)?;
+        if interval != LINE_INDEX_INTERVAL as u32 {
+            // Interval mismatch (e.g. constant changed) — fall back to linear scan.
+            return Ok(vec![vec![]; section_count]);
+        }
+        let count = read_u32(&mut f)? as usize;
+        if count != section_count {
+            return Ok(vec![vec![]; section_count]);
+        }
+        let mut indices = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entry_count = read_u32(&mut f)? as usize;
+            let mut entries = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                let frame_idx = read_u32(&mut f)?;
+                let pos = read_u32(&mut f)?;
+                let byte_lo = read_u32(&mut f)?;
+                let byte_hi = read_u32(&mut f)?;
+                entries.push((frame_idx, pos, (byte_hi as u64) << 32 | byte_lo as u64));
+            }
+            indices.push(entries);
+        }
+        Ok(indices)
     }
 
     /// Look up a single section by `(kind, key)`.
@@ -409,9 +515,10 @@ impl TextReader {
 
     /// Return a paginated slice of non-empty lines from a text section.
     ///
-    /// Reads frames one at a time (64 KiB working memory) rather than loading
-    /// the whole section.  The total line count is stored in the section index
-    /// so it is returned without extra I/O.
+    /// Uses a sparse line index (built during parse) to jump directly to the
+    /// frame containing `offset`, making deep-page navigation O(page_size)
+    /// instead of O(offset).  Falls back to linear scan if the index is absent
+    /// (e.g. caches written before this version).
     ///
     /// Returns `None` if the section does not exist.
     pub fn get_lines_range(
@@ -439,11 +546,30 @@ impl TextReader {
         let mut items: Vec<String> = Vec::with_capacity(limit);
         // Byte buffer for a line being assembled across frame boundaries.
         let mut line_buf: Vec<u8> = Vec::new();
-        let mut lines_seen = 0usize;
 
-        let mut remaining = s.total_len();
-        let mut frame_idx = s.start_frame as usize;
-        let mut pos_in_frame = s.start_pos as usize;
+        // Use the sparse index to jump to the right frame, avoiding a full
+        // linear scan from the start of the section.
+        //
+        // sparse[i] = start of line (i+1)*INTERVAL.
+        // For target `offset`, jump_slot = offset / INTERVAL.
+        // If jump_slot > 0 and sparse[jump_slot-1] exists, start there.
+        let sparse = &self.line_indices[idx];
+        let interval = LINE_INDEX_INTERVAL as usize;
+        let jump_slot = offset / interval;
+        let (mut frame_idx, mut pos_in_frame, mut remaining, mut lines_seen) =
+            if jump_slot > 0 && !sparse.is_empty() {
+                let entry_i = (jump_slot - 1).min(sparse.len() - 1);
+                let (fr, pos, byte_off) = sparse[entry_i];
+                // Guard against a corrupt/mismatched index.
+                if byte_off <= s.total_len() {
+                    let line_base = (entry_i + 1) * interval;
+                    (fr as usize, pos as usize, s.total_len() - byte_off, line_base)
+                } else {
+                    (s.start_frame as usize, s.start_pos as usize, s.total_len(), 0usize)
+                }
+            } else {
+                (s.start_frame as usize, s.start_pos as usize, s.total_len(), 0usize)
+            };
 
         'frames: while remaining > 0 {
             let frame = self.decompress_frame(frame_idx)?;
