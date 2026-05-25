@@ -347,7 +347,7 @@ struct SectionsResponse {
 struct SectionItemJson {
     kind: String,
     key: Option<String>,
-    size_bytes: u32,
+    size_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -2284,10 +2284,10 @@ fn ets_flags(table: &erl_crashdump::model::EtsTable) -> String {
     }
 }
 
-fn sections_markup(fp: &str, _sorted_by: &str, sections: &[(String, Option<String>, u32)]) -> Markup {
+fn sections_markup(fp: &str, _sorted_by: &str, sections: &[(String, Option<String>, u64)]) -> Markup {
     // Group entries by kind; preserve insertion order then sort groups by total size.
     let mut group_order: Vec<String> = Vec::new();
-    let mut groups: std::collections::HashMap<String, Vec<(Option<String>, u32)>> =
+    let mut groups: std::collections::HashMap<String, Vec<(Option<String>, u64)>> =
         std::collections::HashMap::new();
 
     for (kind, key, size) in sections {
@@ -2300,8 +2300,8 @@ fn sections_markup(fp: &str, _sorted_by: &str, sections: &[(String, Option<Strin
 
     // Sort groups by total byte size descending, then alphabetically.
     group_order.sort_by(|a, b| {
-        let ta: u64 = groups[a].iter().map(|(_, s)| *s as u64).sum();
-        let tb: u64 = groups[b].iter().map(|(_, s)| *s as u64).sum();
+        let ta: u64 = groups[a].iter().map(|(_, s)| *s).sum();
+        let tb: u64 = groups[b].iter().map(|(_, s)| *s).sum();
         tb.cmp(&ta).then_with(|| a.cmp(b))
     });
 
@@ -2322,7 +2322,7 @@ fn sections_markup(fp: &str, _sorted_by: &str, sections: &[(String, Option<Strin
                 h1 { "Sections" }
                 @for kind in &group_order {
                     @let entries = &groups[kind];
-                    @let total: u64 = entries.iter().map(|(_, s)| *s as u64).sum();
+                    @let total: u64 = entries.iter().map(|(_, s)| *s).sum();
                     details class="sec-group" {
                         summary {
                             span class="sec-kind" { (kind) }
@@ -2361,10 +2361,10 @@ fn sections_markup(fp: &str, _sorted_by: &str, sections: &[(String, Option<Strin
                                                 @if !has_keys {
                                                     a href=(format!("/dumps/{fp}/query/{}",
                                                         url_encode_component(kind))) {
-                                                        (fmt_bytes(*size as u64))
+                                                        (fmt_bytes(*size))
                                                     }
                                                 } @else {
-                                                    (fmt_bytes(*size as u64))
+                                                    (fmt_bytes(*size))
                                                 }
                                                 " "
                                                 span class="muted" { "(" (*size) " B)" }

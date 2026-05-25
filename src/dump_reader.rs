@@ -116,68 +116,52 @@ impl DumpReader {
 
     /// Return one page of stack entries for a process.
     pub fn process_stack_page(&self, pid: &str, offset: usize, limit: usize) -> Result<Page<StackEntry>> {
-        let content = match self.text.get("proc_stack", Some(pid))? {
+        let page = match self.text.get_lines_range("proc_stack", Some(pid), offset, limit)? {
             None => return Ok(Page::empty(offset, limit)),
-            Some(c) => c,
+            Some(p) => p,
         };
-        Ok(self.stack_page(&content, offset, limit))
+        let items = page.items.iter().map(|raw_line| {
+            let (label, term_str) = split_label_term(raw_line);
+            let first = term_str.as_bytes().first().copied().unwrap_or(0);
+            let is_term_tag = matches!(
+                first,
+                b'N' | b'I' | b'A' | b'H' | b'P' | b'p' | b'l' | b't'
+                    | b'F' | b'B' | b'Y' | b'M' | b'E'
+            );
+            let term = if is_term_tag {
+                self.decoder.parse_term(term_str).ok().map(|(t, _)| t)
+            } else {
+                None
+            };
+            StackEntry { label: label.to_string(), term, raw: term_str.to_string() }
+        }).collect();
+        Ok(Page { items, total: page.total, offset: page.offset, limit: page.limit })
     }
 
     /// Return one page of process-dictionary terms.
     pub fn process_dict_page(&self, pid: &str, offset: usize, limit: usize) -> Result<Page<ErlTerm>> {
-        let content = match self.text.get("proc_dictionary", Some(pid))? {
+        let page = match self.text.get_lines_range("proc_dictionary", Some(pid), offset, limit)? {
             None => return Ok(Page::empty(offset, limit)),
-            Some(c) => c,
+            Some(p) => p,
         };
-        Ok(self.term_lines_page(&content, offset, limit))
+        let items = page.items.iter().filter_map(|line| {
+            let term_str = if line.starts_with('H') { line.as_str() } else { split_label_term(line).1 };
+            self.decoder.parse_term(term_str).ok().map(|(t, _)| t)
+        }).collect();
+        Ok(Page { items, total: page.total, offset: page.offset, limit: page.limit })
     }
 
     /// Return one page of message-queue terms.
     pub fn process_messages_page(&self, pid: &str, offset: usize, limit: usize) -> Result<Page<ErlTerm>> {
-        let content = match self.text.get("proc_messages", Some(pid))? {
+        let page = match self.text.get_lines_range("proc_messages", Some(pid), offset, limit)? {
             None => return Ok(Page::empty(offset, limit)),
-            Some(c) => c,
+            Some(p) => p,
         };
-        Ok(self.term_lines_page(&content, offset, limit))
-    }
-
-    fn stack_page(&self, content: &str, offset: usize, limit: usize) -> Page<StackEntry> {
-        let non_empty = || content.lines().filter(|l| !l.is_empty());
-        let total = non_empty().count();
-        let items = non_empty()
-            .skip(offset)
-            .take(limit)
-            .map(|raw_line| {
-                let (label, term_str) = split_label_term(raw_line);
-                let first = term_str.as_bytes().first().copied().unwrap_or(0);
-                let is_term_tag = matches!(
-                    first,
-                    b'N' | b'I' | b'A' | b'H' | b'P' | b'p' | b'l' | b't'
-                        | b'F' | b'B' | b'Y' | b'M' | b'E'
-                );
-                let term = if is_term_tag {
-                    self.decoder.parse_term(term_str).ok().map(|(t, _)| t)
-                } else {
-                    None
-                };
-                StackEntry { label: label.to_string(), term, raw: term_str.to_string() }
-            })
-            .collect();
-        Page { items, total, offset, limit }
-    }
-
-    fn term_lines_page(&self, content: &str, offset: usize, limit: usize) -> Page<ErlTerm> {
-        let non_empty = || content.lines().filter(|l| !l.is_empty());
-        let total = non_empty().count();
-        let items = non_empty()
-            .skip(offset)
-            .take(limit)
-            .filter_map(|line| {
-                let term_str = if line.starts_with('H') { line } else { split_label_term(line).1 };
-                self.decoder.parse_term(term_str).ok().map(|(t, _)| t)
-            })
-            .collect();
-        Page { items, total, offset, limit }
+        let items = page.items.iter().filter_map(|line| {
+            let term_str = if line.starts_with('H') { line.as_str() } else { split_label_term(line).1 };
+            self.decoder.parse_term(term_str).ok().map(|(t, _)| t)
+        }).collect();
+        Ok(Page { items, total: page.total, offset: page.offset, limit: page.limit })
     }
 
     // ─── Memory ──────────────────────────────────────────────────────────────

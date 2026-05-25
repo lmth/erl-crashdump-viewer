@@ -35,7 +35,7 @@ pub mod dump_reader;
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use extsorter::ExternalSorter;
-use textstore::TextWriter;
+use textstore::{TextWriter, SectionWriter};
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
@@ -126,15 +126,19 @@ fn parse_scanner(
     let mut saw_end = false;
 
     let mut cur_kind = String::new();
-    let mut cur_key: Option<String> = None;
-    let mut text_buf = String::new();
+    // Active streaming writer for the current text section (None for heap/binary/literals).
+    let mut section_writer: Option<SectionWriter<'_>> = None;
     // Set to Some(addr) after a `=binary:ADDR` header; consumed by the next DataLine.
     let mut pending_binary: Option<u64> = None;
 
     for event in scanner {
         match event.context("reading dump")? {
             scanner::Event::NewSection { kind, key } => {
-                flush_text(&mut text, &cur_kind, &cur_key, &mut text_buf, &mut stats)?;
+                // Finish the previous text section (if any).
+                if let Some(sw) = section_writer.take() {
+                    sw.finish().context("finishing text section")?;
+                    stats.text_sections += 1;
+                }
                 pending_binary = None;
                 if kind == "end" {
                     saw_end = true;
@@ -142,8 +146,11 @@ fn parse_scanner(
                     pending_binary =
                         key.as_deref().and_then(|s| u64::from_str_radix(s, 16).ok());
                 }
+                // Start a new streaming writer for text sections.
+                if !is_addr_section(&kind) && kind != "end" && !kind.is_empty() {
+                    section_writer = Some(text.begin_section(&kind, key.as_deref()));
+                }
                 cur_kind = kind;
-                cur_key = key;
             }
 
             scanner::Event::DataLine(line) => {
@@ -177,9 +184,11 @@ fn parse_scanner(
                             &trimmed[..trimmed.len().min(60)]
                         ),
                     }
-                } else {
-                    text_buf.push_str(&line);
-                    text_buf.push('\n');
+                } else if let Some(sw) = section_writer.as_mut() {
+                    // Stream this line directly into the current frame —
+                    // no accumulation in RAM.
+                    sw.write(&line).context("writing text section line")?;
+                    sw.write("\n").context("writing text section newline")?;
                 }
 
                 if total_inserted > 0 && total_inserted % 500_000 == 0 {
@@ -197,7 +206,11 @@ fn parse_scanner(
         }
     }
 
-    flush_text(&mut text, &cur_kind, &cur_key, &mut text_buf, &mut stats)?;
+    // Finish the last text section (if any).
+    if let Some(sw) = section_writer.take() {
+        sw.finish().context("finishing last text section")?;
+        stats.text_sections += 1;
+    }
 
     stats.incomplete = !saw_end;
     if stats.incomplete {
@@ -226,25 +239,6 @@ fn parse_scanner(
 
 fn is_addr_section(kind: &str) -> bool {
     matches!(kind, "proc_heap" | "binary" | "literals")
-}
-
-fn flush_text(
-    writer: &mut TextWriter,
-    kind: &str,
-    key: &Option<String>,
-    buf: &mut String,
-    stats: &mut Stats,
-) -> Result<()> {
-    if kind.is_empty() || is_addr_section(kind) {
-        buf.clear();
-        return Ok(());
-    }
-    if !buf.is_empty() {
-        let content = std::mem::take(buf);
-        writer.insert(kind, key.as_deref(), &content)?;
-        stats.text_sections += 1;
-    }
-    Ok(())
 }
 
 fn parse_addr_line(line: &str) -> Result<(u64, &str)> {
