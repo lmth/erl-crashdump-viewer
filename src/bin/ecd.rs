@@ -54,6 +54,14 @@ fn main() {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // ecd --version / ecd version
+    if args.get(1).map(String::as_str) == Some("--version")
+        || args.get(1).map(String::as_str) == Some("version")
+    {
+        println!("ecd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // ecd list
     if args.get(1).map(String::as_str) == Some("list") {
         return cmd_list();
@@ -76,6 +84,7 @@ fn run() -> Result<()> {
         Some("sections") => cmd_sections(&args),
         _ => {
             eprintln!("Usage:");
+            eprintln!("  ecd version  (or --version)                  — print version");
             eprintln!("  ecd list                                     — list cached dumps");
             eprintln!("  ecd <dump|id> procs    [--sort-by size|pid]  — list all processes");
             eprintln!("  ecd <dump|id> proc     <pid> [--truncate-terms N] [--raw]");
