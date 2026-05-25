@@ -200,6 +200,7 @@ dependencies = [
  "chrono",
  "crashdump-db",
  "flate2",
+ "libc",
  "maud",
  "serde",
  "serde_json",

@@ -38,6 +38,12 @@ use std::process;
 use std::sync::Arc;
 
 fn main() {
+    // Reset SIGPIPE to default so piping into a reader that exits early
+    // (e.g. `ecd ... | head`) terminates the process silently instead of
+    // panicking with "broken pipe".
+    #[cfg(unix)]
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+
     if let Err(e) = run() {
         eprintln!("ecd: {e:#}");
         process::exit(1);

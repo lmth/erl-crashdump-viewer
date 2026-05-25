@@ -27,6 +27,7 @@ xz2 = "0.1"
 base64 = "0.22"
 tempfile = "3"
 anyhow = "1"
+libc = "0.2"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
