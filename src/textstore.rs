@@ -465,6 +465,48 @@ impl TextReader {
         }
     }
 
+    /// Return whether a section exists without loading its content.
+    pub fn has_section(&self, kind: &str, key: Option<&str>) -> bool {
+        let needle = make_key(kind, key);
+        self.sections
+            .binary_search_by(|s| key_bytes(&self.string_table, s.str_offset).cmp(&needle))
+            .is_ok()
+    }
+
+    /// Stream the raw content of a section frame-by-frame into `writer`.
+    ///
+    /// Returns `Ok(true)` if the section existed, `Ok(false)` if not found.
+    /// Uses O(frame_size) memory regardless of section size.
+    pub fn write_content<W: Write>(
+        &self,
+        kind: &str,
+        key: Option<&str>,
+        writer: &mut W,
+    ) -> Result<bool> {
+        let needle = make_key(kind, key);
+        let idx = match self
+            .sections
+            .binary_search_by(|s| key_bytes(&self.string_table, s.str_offset).cmp(&needle))
+        {
+            Err(_) => return Ok(false),
+            Ok(i) => i,
+        };
+        let s = &self.sections[idx];
+        let mut remaining = s.total_len();
+        let mut frame_idx = s.start_frame as usize;
+        let mut pos = s.start_pos as usize;
+        while remaining > 0 {
+            let frame = self.decompress_frame(frame_idx)?;
+            let available = frame.len() - pos;
+            let take = (remaining as usize).min(available);
+            writer.write_all(&frame[pos..pos + take])?;
+            remaining -= take as u64;
+            frame_idx += 1;
+            pos = 0;
+        }
+        Ok(true)
+    }
+
     /// Return metadata for every section: `(kind, key, content_bytes)`.
     /// Sections are in the sorted order stored in the index.
     pub fn list_all(&self) -> Vec<(String, Option<String>, u64)> {

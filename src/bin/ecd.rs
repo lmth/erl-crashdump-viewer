@@ -28,6 +28,7 @@ use crashdump_db::Reader;
 use erl_crashdump::{
     Config, Stats, parse,
     dump_reader::DumpReader,
+    model::Page,
     termdecoder::{ErlTerm, TermDecoder, print_term},
     textstore::TextReader,
 };
@@ -503,30 +504,32 @@ fn cmd_proc(args: &[String]) -> Result<()> {
     let pid = &args[3];
     let opts = parse_opts(&args[4..]);
 
-    // --raw: show section text verbatim without decoding
+    // --raw: stream section text verbatim without decoding.
     if opts.raw {
         let text = TextReader::open(outdir.join("text"))?;
+        let out = std::io::stdout();
+        let mut out = std::io::BufWriter::new(out.lock());
         for kind in &["proc", "proc_stack", "proc_dictionary", "proc_messages"] {
-            if let Some(content) = text.get(kind, Some(pid))? {
-                println!("=== {kind}:{pid} ===");
-                print!("{content}");
+            if text.has_section(kind, Some(pid)) {
+                writeln!(out, "=== {kind}:{pid} ===")?;
+                text.write_content(kind, Some(pid), &mut out)?;
             }
         }
         return Ok(());
     }
 
     let dr = DumpReader::open(&outdir)?;
-    let details = match dr.process(pid)? {
+    let summary = match dr.process_summary(pid)? {
         None => {
             eprintln!("Process {pid} not found");
             return Ok(());
         }
-        Some(d) => d,
+        Some(s) => s,
     };
     let out = std::io::stdout();
     let mut out = std::io::BufWriter::new(out.lock());
 
-    let ps = &details.summary;
+    let ps = &summary;
     writeln!(out, "=== Process {} ===", ps.pid)?;
     if let Some(n) = &ps.name          { writeln!(out, "  Name         : {n}")?; }
     if let Some(s) = &ps.spawned_as    { writeln!(out, "  Spawned as   : {s}")?; }
@@ -543,31 +546,93 @@ fn cmd_proc(args: &[String]) -> Result<()> {
     if !ps.links.is_empty()    { writeln!(out, "  Links        : {}", ps.links.join(", "))?; }
     if !ps.monitors.is_empty() { writeln!(out, "  Monitors     : {}", ps.monitors.join(", "))?; }
 
-    if !details.stack.is_empty() {
-        writeln!(out, "\n--- Stack ({} entries) ---", details.stack.len())?;
-        for e in &details.stack {
+    // Stream stack entries page by page.
+    stream_stack_section(&dr, pid, &mut out, opts.truncate_terms)?;
+
+    // Stream dictionary entries page by page.
+    stream_term_section(
+        &dr, pid, "dict",
+        |dr, pid, off, lim| dr.process_dict_page(pid, off, lim),
+        "Dictionary",
+        &mut out, opts.truncate_terms,
+    )?;
+
+    // Stream message-queue entries page by page.
+    stream_term_section(
+        &dr, pid, "messages",
+        |dr, pid, off, lim| dr.process_messages_page(pid, off, lim),
+        "Messages",
+        &mut out, opts.truncate_terms,
+    )?;
+
+    Ok(())
+}
+
+const PROC_STREAM_PAGE: usize = 1_000;
+
+fn stream_stack_section(
+    dr: &DumpReader,
+    pid: &str,
+    out: &mut impl std::io::Write,
+    truncate: Option<usize>,
+) -> Result<()> {
+    let mut offset = 0;
+    let mut header_written = false;
+    loop {
+        let page = dr.process_stack_page(pid, offset, PROC_STREAM_PAGE)?;
+        if page.total == 0 {
+            break;
+        }
+        if !header_written {
+            writeln!(out, "\n--- Stack ({} entries) ---", page.total)?;
+            header_written = true;
+        }
+        for e in &page.items {
             if let Some(term) = &e.term {
-                writeln!(out, "  {:<14}  {}", e.label, render_term(term, opts.truncate_terms))?;
+                writeln!(out, "  {:<14}  {}", e.label, render_term(term, truncate))?;
             } else {
                 writeln!(out, "  {:<14}  {}", e.label, e.raw)?;
             }
         }
-    }
-
-    if !details.dictionary.is_empty() {
-        writeln!(out, "\n--- Dictionary ({} entries) ---", details.dictionary.len())?;
-        for term in &details.dictionary {
-            writeln!(out, "  {}", render_term(term, opts.truncate_terms))?;
+        offset += page.items.len();
+        if page.items.is_empty() || offset >= page.total {
+            break;
         }
     }
+    Ok(())
+}
 
-    if !details.messages.is_empty() {
-        writeln!(out, "\n--- Messages ({} entries) ---", details.messages.len())?;
-        for term in &details.messages {
-            writeln!(out, "  {}", render_term(term, opts.truncate_terms))?;
+fn stream_term_section<F>(
+    dr: &DumpReader,
+    pid: &str,
+    _kind: &str,
+    fetch: F,
+    title: &str,
+    out: &mut impl std::io::Write,
+    truncate: Option<usize>,
+) -> Result<()>
+where
+    F: Fn(&DumpReader, &str, usize, usize) -> Result<Page<ErlTerm>>,
+{
+    let mut offset = 0;
+    let mut header_written = false;
+    loop {
+        let page = fetch(dr, pid, offset, PROC_STREAM_PAGE)?;
+        if page.total == 0 {
+            break;
+        }
+        if !header_written {
+            writeln!(out, "\n--- {title} ({} entries) ---", page.total)?;
+            header_written = true;
+        }
+        for term in &page.items {
+            writeln!(out, "  {}", render_term(term, truncate))?;
+        }
+        offset += page.items.len();
+        if page.items.is_empty() || offset >= page.total {
+            break;
         }
     }
-
     Ok(())
 }
 
