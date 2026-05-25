@@ -2076,28 +2076,62 @@ fn process_summary_markup(
     }
 }
 
-fn proc_pager(base_url: &str, page: usize, total: usize, per_page: usize, target: &str) -> Markup {
+fn build_extra_qs(truncate: Option<usize>, per_page: usize) -> String {
+    let mut qs = String::new();
+    if let Some(t) = truncate {
+        qs.push_str(&format!("&truncate={t}"));
+    }
+    if per_page != PROC_SECTION_DEFAULT_PER_PAGE {
+        qs.push_str(&format!("&per_page={per_page}"));
+    }
+    qs
+}
+
+fn proc_pager(base_url: &str, extra_qs: &str, page: usize, total: usize, per_page: usize, target: &str) -> Markup {
     if total <= per_page {
         return html! {};
     }
     let total_pages = total.div_ceil(per_page);
     let start = page * per_page + 1;
     let end = ((page + 1) * per_page).min(total);
+    let last_page = total_pages - 1;
+    let go_js = format!(
+        "htmx.ajax('GET','{}?page='+(this.value-1)+'{}',{{target:'#{}',swap:'outerHTML'}})",
+        base_url, extra_qs, target
+    );
     html! {
         div class="pager" {
             span class="muted" { (start) "–" (end) " of " (total) }
             @if page > 0 {
                 button
-                    hx-get=(format!("{base_url}?page={}", page - 1))
+                    hx-get=(format!("{base_url}?page=0{extra_qs}"))
+                    hx-target=(format!("#{target}"))
+                    hx-swap="outerHTML" { "⇤" }
+                button
+                    hx-get=(format!("{base_url}?page={}{extra_qs}", page - 1))
                     hx-target=(format!("#{target}"))
                     hx-swap="outerHTML" { "← Prev" }
             }
-            span { "Page " (page + 1) " / " (total_pages) }
-            @if end < total {
+            span {
+                "Page "
+                input
+                    type="number"
+                    value=(page + 1)
+                    min="1"
+                    max=(total_pages)
+                    style="width:3.5em; text-align:center;"
+                    onchange=(go_js) {}
+                " / " (total_pages)
+            }
+            @if page < last_page {
                 button
-                    hx-get=(format!("{base_url}?page={}", page + 1))
+                    hx-get=(format!("{base_url}?page={}{extra_qs}", page + 1))
                     hx-target=(format!("#{target}"))
                     hx-swap="outerHTML" { "Next →" }
+                button
+                    hx-get=(format!("{base_url}?page={last_page}{extra_qs}"))
+                    hx-target=(format!("#{target}"))
+                    hx-swap="outerHTML" { "⇥" }
             }
         }
     }
@@ -2113,10 +2147,11 @@ fn proc_stack_markup(
 ) -> Markup {
     let pid_enc = url_encode_component(pid);
     let base = format!("/dumps/{fp}/procs/{pid_enc}/stack");
+    let extra_qs = build_extra_qs(truncate, per_page);
     html! {
         div id="proc-stack" {
             h3 style="margin-top:1.2rem;" { "Stack (" (page.total) " entries)" }
-            (proc_pager(&base, page_num, page.total, per_page, "proc-stack"))
+            (proc_pager(&base, &extra_qs, page_num, page.total, per_page, "proc-stack"))
             div class="table-wrap" {
                 table {
                     thead { tr { th { "Label" } th { "Term" } } }
@@ -2148,7 +2183,7 @@ fn proc_stack_markup(
                     }
                 }
             }
-            (proc_pager(&base, page_num, page.total, per_page, "proc-stack"))
+            (proc_pager(&base, &extra_qs, page_num, page.total, per_page, "proc-stack"))
         }
     }
 }
@@ -2166,6 +2201,7 @@ fn proc_term_section_markup(
     let pid_enc = url_encode_component(pid);
     let id = format!("proc-{section}");
     let base = format!("/dumps/{fp}/procs/{pid_enc}/{section}");
+    let extra_qs = build_extra_qs(truncate, per_page);
     let render_item = |term: &ErlTerm| -> Markup {
         let flat = render_term_str(term, truncate);
         if let Some(json_str) = term_json_attr(term) {
@@ -2180,11 +2216,11 @@ fn proc_term_section_markup(
             @if page.total == 0 {
                 p class="muted" { "None." }
             } @else {
-                (proc_pager(&base, page_num, page.total, per_page, &id))
+                (proc_pager(&base, &extra_qs, page_num, page.total, per_page, &id))
                 ol class="details-list" {
                     @for term in &page.items { (render_item(term)) }
                 }
-                (proc_pager(&base, page_num, page.total, per_page, &id))
+                (proc_pager(&base, &extra_qs, page_num, page.total, per_page, &id))
             }
         }
     }
